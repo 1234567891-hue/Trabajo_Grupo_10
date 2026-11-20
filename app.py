@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,7 +12,7 @@ st.set_page_config(page_title="Proyección de Demanda", page_icon="Universidad_d
 
 col_img, col_titulo = st.columns([1, 5])
 with col_img:
-    st.image("Universidad_de_Lima_logo.png", width=120)
+    st.image(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Universidad_de_Lima_logo.png"), width=120)
 with col_titulo:
     st.title("Aplicativo — Caso Adaptado Super Market Sales")
 st.caption("Grupo 10 | Modelamiento Predictivo de Datos — Universidad de Lima")
@@ -67,11 +68,17 @@ archivo = st.sidebar.file_uploader(
          "Debe tener una fila por transacción, con fecha, producto, cantidad, precio y total."
 )
 
-if archivo is None:
+# Si nadie sube un archivo, se carga el dataset del caso que viene en el
+# repositorio, para que quien entra desde el QR vea resultados de inmediato.
+RUTA_CSV_CASO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "supermarket_sales.csv")
+if archivo is not None:
+    df_raw = pd.read_csv(archivo)
+elif os.path.exists(RUTA_CSV_CASO):
+    df_raw = pd.read_csv(RUTA_CSV_CASO)
+    st.sidebar.caption("Usando el dataset del caso (supermarket_sales.csv). Sube otro CSV para analizarlo.")
+else:
     st.info("👈 Sube un archivo CSV en el panel izquierdo para comenzar.")
     st.stop()
-
-df_raw = pd.read_csv(archivo)
 
 st.sidebar.header("2. Configura las columnas")
 st.sidebar.caption(
@@ -407,6 +414,28 @@ with tab_demanda:
 
     boton_descarga(pd.DataFrame(filas_proyeccion_export), "demanda_proyeccion_futura.csv")
 
+    subseccion(
+        "🎯 Escenarios de demanda (pesimista, base y optimista)",
+        "El escenario base es la proyección del modelo ganador. El pesimista y el optimista restan y suman "
+        "a esa proyección el MAPE de validación de cada producto, es decir, el error típico del modelo."
+    )
+    filas_esc = []
+    for prod in productos_top:
+        mape_ganador = comparacion_por_producto[prod][0].iloc[0]["MAPE (%)"] / 100
+        base = proyeccion_futura_por_producto[prod].sum()
+        filas_esc.append({
+            "Producto": prod,
+            "Modelo ganador": mejor_modelo_por_producto[prod],
+            "MAPE (%)": round(mape_ganador * 100, 1),
+            "Pesimista": round(base * (1 - mape_ganador), 1),
+            "Base": round(base, 1),
+            "Optimista": round(base * (1 + mape_ganador), 1),
+        })
+    esc_df = pd.DataFrame(filas_esc)
+    st.dataframe(esc_df, width="stretch")
+    st.caption(f"Total base: {esc_df['Base'].sum():.1f} unidades en {horizonte} periodos. "
+               f"MAPE promedio de los modelos ganadores: {esc_df['MAPE (%)'].mean():.1f} %.")
+
 # ===========================================================================
 # TAB 2 — INVENTARIO (Miyasato)
 # ===========================================================================
@@ -421,26 +450,26 @@ with tab_inventario:
         "Parámetros de inventario",
         "- **Lead time**: cuántos periodos tarda en llegar un pedido.\n"
         "- **Nivel de servicio**: probabilidad de no quedarse sin stock durante el lead time.\n"
-        "- **Costo por pedido**: costo fijo de generar una orden de compra (S/).\n"
+        "- **Costo por pedido**: costo fijo de generar una orden de compra (US$).\n"
         "- **Costo de almacenar x unidad/año**: costo de mantener una unidad en inventario un año."
     )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         lead_time = st.number_input(
-            f"Lead time ({'días' if freq_code=='D' else 'semanas'})", min_value=1, value=3
+            f"Lead time ({'días' if freq_code=='D' else 'semanas'})", min_value=1, value=1
         )
     with c2:
         nivel_servicio = st.select_slider(
             "Nivel de servicio deseado", options=[0.90, 0.95, 0.975, 0.99], value=0.95
         )
     with c3:
-        costo_pedido = st.number_input("Costo por pedido (S/)", min_value=0.0, value=50.0)
+        costo_pedido = st.number_input("Costo por pedido (US$)", min_value=0.0, value=50.0)
     with c4:
         tasa_almacenamiento = st.slider(
             "Tasa de almacenamiento anual (% del valor del producto)", 10, 35, 22,
             help="Costo de mantener inventario, como % del precio del producto por año (capital inmovilizado, "
                  "riesgo de obsolescencia, espacio). La literatura de costos logísticos documenta un rango típico "
-                 "de 15%-35% anual; 20-25% es el valor de referencia más común en retail (Azim et al., 2025)."
+                 "de 15%-35% anual; en el caso se usa 22 %, el punto medio de ese rango."
         ) / 100
 
     z = norm.ppf(nivel_servicio)
@@ -505,6 +534,47 @@ with tab_inventario:
     ax.set_ylabel("Unidades")
     ax.legend()
     st.pyplot(fig)
+
+    subseccion(
+        "🎯 Escenarios de nivel de servicio (90 %, 95 % y 99 %)",
+        "Compara tres niveles de servicio con los mismos parámetros de arriba. Unidades faltantes al año = "
+        "(D/Q) × σ × √LT × G(Z), con G(Z) la función de pérdida normal. Venta perdida = faltantes × precio medio "
+        "(supuesto: el faltante se valora al precio de venta). Costo total = pedir + mantener + venta perdida."
+    )
+    filas_ns = []
+    for ns in [0.90, 0.95, 0.99]:
+        z_ns = norm.ppf(ns)
+        g_z = norm.pdf(z_ns) - z_ns * (1 - norm.cdf(z_ns))
+        ss_txt, rop_txt = [], []
+        faltantes = costo_inv = venta_perdida = 0.0
+        for prod in productos_top:
+            serie_hist = series_por_producto[prod]
+            mu, sd = serie_hist.mean(), serie_hist.std()
+            precio_prod = df[df[col_producto] == prod][col_precio].mean()
+            h = tasa_almacenamiento * precio_prod
+            d_anual = mu * periodos_por_anio
+            q_eoq = np.sqrt(2 * d_anual * costo_pedido / h)
+            ss = z_ns * sd * np.sqrt(lead_time)
+            ss_txt.append(f"{ss:.1f}")
+            rop_txt.append(f"{mu * lead_time + ss:.1f}")
+            falt = (d_anual / q_eoq) * sd * np.sqrt(lead_time) * g_z
+            faltantes += falt
+            venta_perdida += falt * precio_prod
+            costo_inv += (d_anual / q_eoq) * costo_pedido + (q_eoq / 2 + ss) * h
+        filas_ns.append({
+            "Nivel de servicio": f"{ns:.0%}",
+            "Stock de seguridad": " / ".join(ss_txt),
+            "Punto de reorden": " / ".join(rop_txt),
+            "Unidades faltantes/año": round(faltantes, 1),
+            "Costo de inventario (US$/año)": round(costo_inv),
+            "Venta perdida (US$/año)": round(venta_perdida),
+            "Costo total (US$/año)": round(costo_inv + venta_perdida),
+        })
+    ns_df = pd.DataFrame(filas_ns)
+    st.dataframe(ns_df, width="stretch")
+    mejor_ns = ns_df.loc[ns_df["Costo total (US$/año)"].idxmin(), "Nivel de servicio"]
+    st.success(f"Menor costo total: nivel de servicio {mejor_ns}. El orden de los productos en las columnas es: "
+               + ", ".join(productos_top) + ".")
 
     with st.expander("📖 Notas sobre las fórmulas usadas"):
         st.markdown("""
